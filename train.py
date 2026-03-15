@@ -14,6 +14,8 @@ import inspect
 from pathlib import Path
 from collections import defaultdict
 
+from utils.event_logger import EventLogger
+
 import toml
 import deepspeed
 from deepspeed import comm as dist
@@ -190,7 +192,7 @@ def evaluate_single(model_engine, eval_dataloader, eval_gradient_accumulation_st
     return total_loss / count
 
 
-def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps):
+def _evaluate(model_engine, eval_dataloaders, tb_writer, event_logger, step, eval_gradient_accumulation_steps):
     pbar_total = 0
     for eval_dataloader in eval_dataloaders.values():
         pbar_total += len(eval_dataloader) * len(TIMESTEP_QUANTILES_FOR_EVAL) // eval_gradient_accumulation_steps
@@ -215,6 +217,9 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
             tb_writer.add_scalar(f'{name}/loss', avg_loss, step)
             if wandb_enable:
                 wandb.log({f'{name}/loss': avg_loss, 'step': step})
+            if event_logger:
+                quantile_losses = {f'q{q:.2f}': l for q, l in zip(TIMESTEP_QUANTILES_FOR_EVAL, losses)}
+                event_logger.log({'type': 'eval', 'step': step, 'name': name, 'avg_loss': avg_loss, 'quantile_losses': quantile_losses})
 
     duration = time.time() - start
     if is_main_process():
@@ -224,7 +229,7 @@ def _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_acc
         pbar.close()
 
 
-def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps, disable_block_swap):
+def evaluate(model, model_engine, eval_dataloaders, tb_writer, event_logger, step, eval_gradient_accumulation_steps, disable_block_swap):
     if len(eval_dataloaders) == 0:
         return
     empty_cuda_cache()
@@ -234,7 +239,7 @@ def evaluate(model, model_engine, eval_dataloaders, tb_writer, step, eval_gradie
         random.seed(seed)
         torch.manual_seed(seed)
         np.random.seed(seed)
-        _evaluate(model_engine, eval_dataloaders, tb_writer, step, eval_gradient_accumulation_steps)
+        _evaluate(model_engine, eval_dataloaders, tb_writer, event_logger, step, eval_gradient_accumulation_steps)
     empty_cuda_cache()
     model.prepare_block_swap_training()
 
@@ -836,11 +841,33 @@ if __name__ == '__main__':
 
     epoch = train_dataloader.epoch
     tb_writer = SummaryWriter(log_dir=run_dir) if is_main_process() else None
+    event_logger = EventLogger(run_dir) if is_main_process() else None
     saver = utils.saver.Saver(args, config, is_adapter, run_dir, model, train_dataloader, model_engine, pipeline_model)
+
+    if event_logger:
+        event_logger.log({
+            'type': 'training_start',
+            'model_type': model_type,
+            'dataset': config['dataset'],
+            'epochs': config['epochs'],
+            'steps_per_epoch': steps_per_epoch,
+            'save_every_n_steps': config.get('save_every_n_steps', None),
+            'save_every_n_epochs': config.get('save_every_n_epochs', None),
+            'checkpoint_every_n_minutes': config.get('checkpoint_every_n_minutes', None),
+            'adapter': config.get('adapter', None),
+            'optimizer': {k: v for k, v in config['optimizer'].items() if k != 'type'} | {'type': config['optimizer']['type']},
+            'global_batch_size': global_batch_size,
+            'run_dir': run_dir,
+        })
+
+    if event_logger and resume_from_checkpoint:
+        event_logger.log({'type': 'log', 'level': 'info', 'message': f'Resumed from checkpoint at epoch {train_dataloader.epoch}, step {step}'})
 
     disable_block_swap_for_eval = config.get('disable_block_swap_for_eval', False)
     if config['eval_before_first_step'] and not resume_from_checkpoint:
-        evaluate(model, model_engine, eval_dataloaders, tb_writer, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
+        if event_logger:
+            event_logger.log({'type': 'log', 'level': 'info', 'message': 'Running initial evaluation'})
+        evaluate(model, model_engine, eval_dataloaders, tb_writer, event_logger, 0, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
     # TODO: this is state we need to save and resume when resuming from checkpoint. It only affects logging.
     epoch_loss = 0
@@ -855,14 +882,23 @@ if __name__ == '__main__':
         train_dataloader.sync_epoch()
 
         new_epoch, checkpointed, saved = saver.process_epoch(epoch, step, examples)
+        if is_main_process():
+            if checkpointed:
+                event_logger.log({'type': 'checkpoint', 'step': step, 'epoch': epoch})
+                event_logger.log({'type': 'log', 'level': 'info', 'message': f'Checkpoint saved at step {step}'})
+            if saved:
+                event_logger.log({'type': 'save', 'step': step, 'name': f'epoch{epoch}'})
+                event_logger.log({'type': 'log', 'level': 'info', 'message': f'Model saved: epoch{epoch}'})
         finished_epoch = True if new_epoch != epoch else False
 
         x_axis = examples if config['x_axis_examples'] else step
 
         if is_main_process() and step % config['logging_steps'] == 0:
             tb_writer.add_scalar(f'train/loss', loss, x_axis)
+            step_event = {'type': 'step', 'step': step, 'epoch': epoch, 'loss': loss, 'examples': examples}
             if hasattr(optimizer, '_grad_norm'):
                 tb_writer.add_scalar(f'train/grad_norm', optimizer._grad_norm, x_axis)
+                step_event['grad_norm'] = float(optimizer._grad_norm)
             if wandb_enable:
                 wandb.log({'train/loss': loss, 'step': x_axis})
                 if hasattr(optimizer, '_grad_norm'):
@@ -875,15 +911,20 @@ if __name__ == '__main__':
                 if avg_lr > 0:
                     tb_writer.add_histogram(f'train/automagic_lrs', lrs, x_axis)
                     tb_writer.add_scalar(f'train/automagic_avg_lr', avg_lr, x_axis)
+            event_logger.log(step_event)
 
         if (config['eval_every_n_steps'] and step % config['eval_every_n_steps'] == 0) or (finished_epoch and config['eval_every_n_epochs'] and epoch % config['eval_every_n_epochs'] == 0):
-            evaluate(model, model_engine, eval_dataloaders, tb_writer, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
+            if event_logger:
+                event_logger.log({'type': 'log', 'level': 'info', 'message': f'Running evaluation at step {step}'})
+            evaluate(model, model_engine, eval_dataloaders, tb_writer, event_logger, x_axis, config['eval_gradient_accumulation_steps'], disable_block_swap_for_eval)
 
         if finished_epoch:
             if is_main_process():
                 tb_writer.add_scalar(f'train/epoch_loss', epoch_loss/num_steps, epoch)
                 if wandb_enable:
                     wandb.log({'train/epoch_loss': epoch_loss/num_steps, 'epoch': epoch})
+                event_logger.log({'type': 'epoch', 'epoch': epoch, 'epoch_loss': epoch_loss/num_steps})
+                event_logger.log({'type': 'log', 'level': 'info', 'message': f'Epoch {epoch} complete — loss {epoch_loss/num_steps:.4f}'})
             epoch_loss = 0
             num_steps = 0
             if new_epoch is None:
@@ -892,6 +933,13 @@ if __name__ == '__main__':
             epoch = new_epoch
 
         checkpointed, saved = saver.process_step(step, examples)
+        if is_main_process():
+            if checkpointed:
+                event_logger.log({'type': 'checkpoint', 'step': step, 'epoch': epoch})
+                event_logger.log({'type': 'log', 'level': 'info', 'message': f'Checkpoint saved at step {step}'})
+            if saved:
+                event_logger.log({'type': 'save', 'step': step, 'name': f'step{step}'})
+                event_logger.log({'type': 'log', 'level': 'info', 'message': f'Model saved: step{step}'})
         if 'max_steps' in config and step >= config['max_steps']:
             final_model_name = f'step{step}'
             break
@@ -905,4 +953,6 @@ if __name__ == '__main__':
         saver.save_model(final_model_name)
 
     if is_main_process():
+        event_logger.log({'type': 'training_complete', 'step': step, 'epoch': epoch, 'final_model': final_model_name})
+        event_logger.close()
         print('TRAINING COMPLETE!')
