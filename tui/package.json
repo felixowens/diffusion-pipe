@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "dev": "tsx src/index.tsx",
-    "mock": "tsx src/mock-generator.ts"
+    "mock": "tsx src/mock-generator.ts",
+    "test:contract": "tsx src/test-contract.ts"
   },
   "dependencies": {
     "chokidar": "^4.0.3",
